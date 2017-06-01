@@ -1,0 +1,286 @@
+```{r,message=FALSE,warning=FALSE}
+# Load Packages
+library(ggplot2)
+library(readr)
+library(magrittr)
+library(dplyr)
+library(e1071)
+library(rpart)
+library(Metrics)
+library(randomForest)
+library(Matrix)
+library(methods)
+library(MLmetrics)
+library(rpart.plot)
+library(corrplot)
+library(xgboost)
+library(caret)
+library(doMC)
+registerDoMC(cores=4)
+library(C50)
+library(nnet)
+library(h2o)
+```
+
+```{r load}
+train <- read.csv("~/Downloads/ISQS6348 Multivariate/Leaf Classification/train.csv", header=TRUE)
+test <- read.csv("~/Downloads/ISQS6348 Multivariate/Leaf Classification/test.csv", header=TRUE)
+train$species <- as.factor(train$species)
+rf_train<- train
+rf_test<- test
+```
+
+```{r}
+#glance at the eigen values and it's eigne vector
+#sum of the eigen values is always equal to sum of the total variance of the features.
+train_s<- train[,-(1:2)]
+pc <- princomp(train_s, cor=TRUE, scores = TRUE)
+summary(pc)
+plot(pc)
+plot(pc ,type = "l")
+biplot(pc)
+dim(train_m)
+attributes(pc)
+pc$loadings
+pc$loadings[,1:2]
+#standardize the data
+std <- function(x){
+  (x - mean(x))
+}
+std_train <- apply(train_s,2,function(x) (x*1000))
+#to the covariance of the features in train dataset
+train_cov <- cov(std_train)
+#to check the eigen values
+train_eigen <- eigen(train_cov)
+sum(train_eigen$values)
+#check with the variace of all the features
+loadings <- train_eigen$values
+scores = std_train %*% loadings
+sd =sqrt(train_eigen$values)
+```
+
+```{r,message=FALSE,warning=FALSE}
+train<- train[,-1]
+test<- test
+# Type/Class of variables 
+sapply(train, class)
+#check for NA values
+Num_NA<-sapply(train,function(y)length(which(is.na(y)==T)))
+sum(Num_NA)
+#no NA values, the data cleaning need not to be done
+```
+
+
+Thanks to jason lin for the wonderfull visualization.
+link : https://www.kaggle.com/jiashenliu/leaf-classification/updatedtry-5-different-classifiers-and-questions/run/369158
+```{r,message=FALSE,warning=FALSE}
+#check the corelation amongs the shape features
+correlations<- cor(train %>% select(contains("shape")),use="everything")
+corrplot(correlations, method="circle", type="lower",  sig.level = 0.01, insig = "blank")
+
+#check the corelation amongs the shape features
+correlations<- cor(train %>% select(contains("margin")),use="everything")
+corrplot(correlations, method="circle", type="lower",  sig.level = 0.01, insig = "blank")
+#check the corelation amongs the shape features
+correlations<- cor(train %>% select(contains("texture")),use="everything")
+corrplot(correlations, method="circle", type="lower",  sig.level = 0.01, insig = "blank")
+
+```
+
+```{r,message=FALSE,warning=FALSE}
+#there are total 192 features for 99 types of species. 
+#to avoid overfitting of the model let's just use those features who have maximum variance.
+#to reduce the number of features let's use the concept of principle component.
+#selecting only margin column from the training dataset and apply principle component
+Margin <- train[,grepl("margin", colnames(train))]
+princ_Margin<-princomp(Margin)
+#with help of summary we can get to know the the variance cover by each of the principle component
+summary(princ_Margin)
+plot(princ_Margin)
+#attributes are used to know the different values that are cover in the principle component.
+attributes(princ_Margin)
+princ_Margin$loadings
+#similarly with the shape feature, apple principle component.
+Shape<- train[,grepl("shape", colnames(train))]
+princ_shape<-princomp(Shape)
+summary(princ_shape)
+plot(princ_shape)
+#similarly with the texture feature, apple principle component.
+Texture <- train[,grepl("texture", colnames(train))]
+princ_texture<-princomp(Texture)
+summary(princ_texture)
+plot(princ_texture)
+
+#combine those features using their principle component we have to access them using their scores.
+#here we have tried to cover 70% of the variance
+Train_PCA<- data.frame(train$species,princ_Margin$scores[,1:9],princ_shape$scores[,1:3],princ_texture$scores[,1:15])
+
+#to select the those particular features from the test data. lets just use predict function and take those features only used by the train_PCA
+test_m <- test[,grepl("margin", colnames(test))]
+test_s<- test[,grepl("shape", colnames(test))]
+test_t <- test[,grepl("texture", colnames(test))]
+Test_Margin<- predict(princ_Margin,newdata=test_m)[,1:9]
+Test_Shape<- predict(princ_shape,newdata=test_s)[,1:3]
+Test_Texture<- predict(princ_texture,newdata=test_t)[,1:15]
+Test_final<- data.frame(test$id,Test_Margin,Test_Shape,Test_Texture)
+
+```
+
+NaivesBayes Model
+Naive Bayes is often the first port of call in prediction problems simply because it is easy to set up and is fast compared to many of the iterative algorithms.
+```{r,message=FALSE,warning=FALSE}
+naivebayes_model<- naiveBayes(train.species~.,Train_PCA)
+NB_predict<- predict(naivebayes_model,newdata=Train_PCA[,2:27],type='raw')
+
+#to find out the log loss of the model function from MLMetrix package is used. 
+naive_logloss<-MultiLogLoss(y_true = Train_PCA[,1], y_pred = as.matrix(NB_predict))
+submit<- predict(naivebayes_model,newdata=Test_final,type='raw')
+write_file<- data.frame(id=Test_final$test.id,submit)
+write.csv(write_file,'submit1.csv',row.names=FALSE)
+
+```
+
+#Random Forest
+```{r, message=FALSE,warning=FALSE}
+
+#with PCA
+set.seed(1234)
+#resampling different mothod are avalible like cross validation (CV), repeatedCV, leave-one-out cross-validation (LOOCV),leave-group-out cross validation. 
+#using LOOCV because it gave best result in my try and error method.
+Control<- trainControl(method='LOOCV',number =10,repeats=3)
+rf<- train(Train_PCA[,2:27],Train_PCA[,1],method='rf',prox=TRUE,allowParallel=TRUE,trControl=Control)
+rf_predict<- predict(rf,newdata= Train_PCA[,2:27],type='prob')
+rf_logloss<-MultiLogLoss(y_true = Train_PCA[,1], y_pred = as.matrix(rf_predict))
+
+rf_submit<- predict(rf,newdata=Test_final,type='prob')
+write_file<- data.frame(id=Test_final$test.id,rf_submit)
+write.csv(write_file,'rf_submission.csv',row.names=FALSE)
+
+#Using whole train dataset
+contrl <- trainControl(method = "LOOCV", number = 30, selectionFunction = "best", classProbs = TRUE, summaryFunction = multiClassSummary)
+grid <- expand.grid(.mtry = c(4, 40))
+rf_model <- train(species ~ ., data = rf_train, method = "rf", trControl = contrl, tuneGrid = grid) 
+rf_predict<- predict(rf_model, rf_test , type = 'prob')
+
+rf_submit<- data.frame(id=rf_test[,1],rf_predict)
+write.csv(rf_submit, 'rf_submission_2.csv',row.names=FALSE)
+
+```
+
+Support machine vector
+```{r}
+
+ctrl <- trainControl(method = "cv", number = 5, repeats=3, selectionFunction = "best", classProbs = TRUE,summaryFunction = multiClassSummary)
+grid <- expand.grid(.cost = c(0.001, 0.01, 0.1, 1, 5))
+system.time(svm_model <- train(train.species ~ ., data = Train_PCA, method = "svmLinear2", 
+                 trControl = ctrl, tuneGrid = grid))
+svm_predict <- predict(svm_model, Train_PCA, type='prob')
+svm_logloss<-MultiLogLoss(y_true = Train_PCA[,1], y_pred = as.matrix(svm_predict))
+svm_logloss
+plot(svm_model, Train_PCA)
+svm_predict <- predict(svm_model, Test_final, type='prob')
+submit<- data.frame(id=Test_final[,1],svm_predict)
+write.csv(submit, 'svmlinear_try.csv',row.names=FALSE)
+
+```
+
+
+eXtreme Gradient Boosting
+Xgboost
+```{r}
+
+set.seed(1234)
+xg_control <- trainControl(method = "", repeats = 10,number = 3)
+
+xgb_grid <- expand.grid(nrounds = 75, max_depth = 10 , eta = 1, gamma = c(0.0, 0.2, 1), colsample_bytree = c(0.5,0.8, 1), min_child_weight= 1)
+
+xgb_tune <-train(train.species ~., data=Train_PCA, method="xgbTree", trControl=xg_control, tuneGrid=xgb_grid)
+xgb_predict<- predict(xgb_tune,newdata= Train_PCA,type='prob')
+xgb_logloss<-MultiLogLoss(y_true = Train_PCA[,1], y_pred = as.matrix(xgb_predict))
+
+xgb_predict <- predict(xgb_tune, Test_final, type='prob')
+xgb_submit<- data.frame(id=Test_final[,1],xgb_predict)
+write.csv(xgb_submit, 'xgb_submission.csv',row.names=FALSE)
+
+```
+
+C5.0
+```{r}
+
+ctrl <- trainControl(method = "cv", number = 30, selectionFunction = "best")
+fit.c50tree <- train(species ~ ., data = rf_train, 
+                     method = "C5.0Tree", trControl = ctrl)
+
+C5_predict<- predict(fit.c50tree, rf_test , type = 'prob')
+
+rf_submit<- data.frame(id=rf_test[,1],C5_predict)
+write.csv(rf_submit, 'C5_submission_2.csv',row.names=FALSE)
+
+```
+
+trying with the neural network
+```{r}
+dataset.train <- read.csv("~/Downloads/ISQS6348 Multivariate/Leaf Classification/train.csv", header=TRUE)
+dataset.test <- read.csv("~/Downloads/ISQS6348 Multivariate/Leaf Classification/test.csv", header=TRUE)
+
+dataset.train1 <- dataset.train[,c(-1,-2)]
+dataset.label<- as.factor(dataset.train$species)
+
+dataset.test1 <- dataset.test[,-1]
+set.seed(82)
+nnet_model <- nnet(label ~ ., data = data.frame(dataset.train1, label = dataset.label), 
+                   MaxNWts = 20000, decay = 0.05,  skip = F, maxit = 200, size = 75, trace = F)
+
+nnet_prediction <- predict(model.nnet, dataset.test1 , type="raw")
+write_csv(data.frame(id=dataset.test$id, nnet_prediction), "nnet_submission_2.csv")
+
+#gave the best result 
+```
+
+using h2o deep learning
+```{r}
+h20.train <- read.csv("~/Downloads/ISQS6348 Multivariate/Leaf Classification/train.csv", header=TRUE)
+h20.test <- read.csv("~/Downloads/ISQS6348 Multivariate/Leaf Classification/test.csv", header=TRUE)
+h2o.init(ip = "localhost", port = 54321, startH2O = TRUE, 
+                    max_mem_size = '8g')
+ h2o.train <- as.h2o(h20.train)
+ h2o.test <- as.h2o(h20.test)
+ y <- "species"
+ h2o.train1 <- h2o.train[,c(-1)]
+ x<- names(h2o.train1) 
+ 
+ model_1 <- h2o.deeplearning(x=x, y=y, l1=1e-3,
+                             training_frame = h2o.train1, # % of inputs dropout
+                             hidden_dropout_ratios = c(0.45,0.35, 0.5, 0.4),
+                             activation = "RectifierWithDropout", epochs = 130,l2=1e-5,
+                             hidden = c(1024, 512, 256, 50),variable_importances=TRUE,
+                             seed=5
+ ) 
+ 
+prediction.hex <- h2o.predict(model_1, h2o.test)
+prediction.hex$predict <-NULL
+hex_predict <- as.data.frame(prediction.hex)
+submit <- data.frame(id = test$id , h2o_data_frame)
+write.csv(submit, 'h2o.csv',row.names=FALSE)
+
+
+```
+
+h2o gbm
+```{r}
+gbm2 <- h2o.gbm(
+   training_frame = h2o.train1 ,     ##
+   
+   x=x,                     ##
+   y=y,                       ## 
+   ntrees = 200,                ## decrease the trees, mostly to allow for run time
+   ##  (from 50)
+   learn_rate = 0.2,           ## increase the learning rate (from 0.1)
+   max_depth = 50,             ## increase the depth (from 5)
+   model_id = "gbm_covType2",  ##
+   seed = 2000000)             ##
+
+
+```
+
+
